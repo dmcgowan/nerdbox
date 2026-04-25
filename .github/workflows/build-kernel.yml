@@ -6,7 +6,7 @@ on:
       kernel_version:
         description: 'Kernel version to build'
         required: true
-        default: '6.12.44'
+        default: '6.18.24'
       kernel_nproc:
         description: 'Number of parallel build processes'
         required: false

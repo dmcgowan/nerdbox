@@ -3,7 +3,7 @@ variable "HOST_OS" {
 }
 
 variable "KERNEL_VERSION" {
-  default = "6.12.44"
+  default = "6.18.24"
 }
 
 variable "KERNEL_ARCH" {
