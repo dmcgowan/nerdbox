@@ -18,6 +18,7 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/nerdbox/internal/shim/sandbox"
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
@@ -155,6 +157,111 @@ func TestBlockMountsProvider(t *testing.T) {
 			assert.Equal(t, tc.wantVmMounts, bm.VmMounts())
 		})
 	}
+}
+
+// TestTransformMountsErofsToVirtiofs covers the new EROFS handling:
+// each erofs layer is hard-linked into <blobsDir>/<id>/<index>.erofs,
+// guest mount specs reference the file under blobshare.MountPath, no
+// virtio-block device is allocated for EROFS, and the blob share is
+// added once via WithFSDAX.
+func TestTransformMountsErofsToVirtiofs(t *testing.T) {
+	const id = "ctr-erofs"
+
+	tmp := t.TempDir()
+	src0 := filepath.Join(tmp, "layer0.erofs")
+	src1 := filepath.Join(tmp, "layer1.erofs")
+	if err := os.WriteFile(src0, []byte("layer0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src1, []byte("layer1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	blobsDir := filepath.Join(tmp, "vm", "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mounts := []*types.Mount{
+		{Type: "ext4", Source: filepath.Join(tmp, "rw.ext4"), Options: []string{"rw", "loop"}},
+		{Type: "erofs", Source: src0, Options: []string{"ro", "loop"}},
+		{Type: "erofs", Source: src1, Options: []string{"ro", "loop"}},
+	}
+
+	da := newDiskAllocator()
+	out, sbOpts, err := transformMounts(context.Background(), id, mounts, blobsDir, &da)
+	assert.NoError(t, err)
+
+	// EROFS no longer takes a virtio-block letter; only ext4 should.
+	assert.Equal(t, byte('b'), da.next, "ext4 should consume vda; EROFS should not allocate a letter")
+
+	// Guest mount specs: ext4 stays virtio-block; erofs become file
+	// sources under the blob share's mount path.
+	assert.Len(t, out, 3)
+	assert.Equal(t, "ext4", out[0].Type)
+	assert.Equal(t, "/dev/vda", out[0].Source)
+	assert.Equal(t, "erofs", out[1].Type)
+	assert.Equal(t, "/run/nerdbox/blobs/"+id+"/0.erofs", out[1].Source)
+	assert.Equal(t, "erofs", out[2].Type)
+	assert.Equal(t, "/run/nerdbox/blobs/"+id+"/1.erofs", out[2].Source)
+
+	// The shim should hard-link each blob into <blobsDir>/<id>/.
+	stagedDir := filepath.Join(blobsDir, id)
+	for i, src := range []string{src0, src1} {
+		dst := filepath.Join(stagedDir, fmt.Sprintf("%d.erofs", i))
+		dstInfo, err := os.Stat(dst)
+		if err != nil {
+			t.Fatalf("staged blob %d not found: %v", i, err)
+		}
+		srcInfo, err := os.Stat(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Same inode means hard link (no copy).
+		assert.True(t, os.SameFile(srcInfo, dstInfo), "blob %d should be hard-linked, not copied", i)
+	}
+
+	// Sandbox opts should include the disk for ext4 + the blob share.
+	o := applyOpts(sbOpts)
+	assert.Len(t, o.Disks, 1, "only ext4 should produce a disk")
+	assert.Len(t, o.Filesystems, 1, "blob share should be added once")
+	assert.Equal(t, "nerdbox-blobs", o.Filesystems[0].Tag)
+	assert.Equal(t, blobsDir, o.Filesystems[0].MountPath)
+	assert.True(t, o.Filesystems[0].Readonly)
+	assert.Greater(t, o.Filesystems[0].DAXWindow, uint64(0))
+}
+
+// TestStageBlobHardLink verifies stageBlob hard-links rather than
+// copies when source and destination are on the same filesystem.
+func TestStageBlobHardLink(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+	if err := os.WriteFile(src, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageBlob(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstInfo, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.True(t, os.SameFile(srcInfo, dstInfo), "stageBlob should produce a hard link on the same fs")
+
+	// Idempotent: a second call leaves the file in place.
+	if err := stageBlob(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	dstInfo2, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.True(t, os.SameFile(dstInfo, dstInfo2))
 }
 
 func TestBindMountsProvider(t *testing.T) {

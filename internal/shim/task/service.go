@@ -220,10 +220,18 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 		return nil, errgrpc.ToGRPCf(err, "failed to create vm state directory %q", vmState)
 	}
 
+	// blobsDir is the host-side root of the read-only virtio-fs share
+	// that vminitd mounts at blobshare.MountPath. Per-EROFS-layer files
+	// are hard-linked under <blobsDir>/<container-id>/.
+	blobsDir := filepath.Join(vmState, "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		return nil, errgrpc.ToGRPCf(err, "failed to create blobs directory %q", blobsDir)
+	}
+
 	// da is shared across rootfs and volume disk allocation so that all
 	// virtio-block devices within a container get unique, sequential letters.
 	da := newDiskAllocator()
-	m, mountOpts, err := setupMounts(ctx, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"), &da)
+	m, mountOpts, err := setupMounts(ctx, r.ID, r.Rootfs, b.Rootfs, filepath.Join(r.Bundle, "mounts"), blobsDir, &da)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}

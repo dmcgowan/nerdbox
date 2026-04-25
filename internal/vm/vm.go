@@ -58,6 +58,11 @@ func WithConsoleWriter(w io.Writer) StartOpt {
 type MountConfig struct {
 	Readonly bool
 	Vmdk     bool
+	// DAXWindow, when > 0, enables a DAX SHM window of the given size (in
+	// bytes) on a virtio-fs share. Reads through the share are served
+	// directly from the host page cache, avoiding double-caching in the
+	// guest.
+	DAXWindow uint64
 }
 
 type MountOpt func(*MountConfig)
@@ -89,5 +94,13 @@ func WithReadOnly() MountOpt {
 func WithVmdk() MountOpt {
 	return func(o *MountConfig) {
 		o.Vmdk = true
+	}
+}
+
+// WithDAXWindow enables a DAX shared-memory window of the given size on
+// a virtio-fs share. Only meaningful for AddFS.
+func WithDAXWindow(size uint64) MountOpt {
+	return func(o *MountConfig) {
+		o.DAXWindow = size
 	}
 }

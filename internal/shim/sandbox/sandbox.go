@@ -38,6 +38,10 @@ type Filesystem struct {
 	Tag       string
 	MountPath string
 	Readonly  bool
+	// DAXWindow, when > 0, enables a DAX SHM window of this size (bytes)
+	// on the share. Reads bypass the guest page cache and are served
+	// directly from the host page cache.
+	DAXWindow uint64
 }
 
 type DiskFlags uint8
@@ -79,6 +83,21 @@ func WithFS(tag, mountPath string, readonly bool) Opt {
 			Tag:       tag,
 			MountPath: mountPath,
 			Readonly:  readonly,
+		})
+	}
+}
+
+// WithFSDAX adds a virtio-fs share with a DAX SHM window of dax bytes
+// and a read-only flag. Use for read-only shares that benefit from
+// host-page-cache passthrough (EROFS layer blobs, content-addressed
+// stores).
+func WithFSDAX(tag, mountPath string, dax uint64, readonly bool) Opt {
+	return func(o *Options) {
+		o.Filesystems = append(o.Filesystems, Filesystem{
+			Tag:       tag,
+			MountPath: mountPath,
+			Readonly:  readonly,
+			DAXWindow: dax,
 		})
 	}
 }

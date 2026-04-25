@@ -157,6 +157,21 @@ func (vmc *vmcontext) AddVirtiofs(tag, path string) error {
 	return nil
 }
 
+// AddVirtiofs3 adds a virtio-fs share with a DAX SHM window and a
+// read-only flag. shmSize is the size in bytes of the DAX window
+// exposed as a PCI BAR; 0 disables DAX. readOnly exposes the share
+// as read-only to the guest.
+func (vmc *vmcontext) AddVirtiofs3(tag, path string, shmSize uint64, readOnly bool) error {
+	if vmc.lib.AddVirtiofs3 == nil {
+		return fmt.Errorf("libkrun not loaded or krun_add_virtiofs3 unavailable")
+	}
+	ret := vmc.lib.AddVirtiofs3(vmc.ctxID, tag, path, shmSize, readOnly)
+	if ret != 0 {
+		return fmt.Errorf("krun_add_virtiofs3 failed: %d", ret)
+	}
+	return nil
+}
+
 func (vmc *vmcontext) AddDisk(blockID, path string, readonly bool) error {
 	if vmc.lib.AddDisk == nil {
 		return fmt.Errorf("libkrun not loaded")
@@ -261,6 +276,7 @@ type libkrun struct {
 	StartEnter         func(ctxID uint32) int32                                                               `C:"krun_start_enter"`
 	AddVsockPort       func(ctxID, port uint32, path string, listen bool) int32                               `C:"krun_add_vsock_port2"`
 	AddVirtiofs        func(ctxID uint32, tag, path string) int32                                             `C:"krun_add_virtiofs"`
+	AddVirtiofs3       func(ctxID uint32, tag, path string, shmSize uint64, readOnly bool) int32              `C:"krun_add_virtiofs3"`
 	GetShutdownEventfd func(ctxID uint32) int32                                                               `C:"krun_get_shutdown_eventfd"`
 	SetGpuOptions      func(ctxID, flag uint32) int32                                                         `C:"krun_set_gpu_options"`
 	SetGvproxyPath     func(ctxID uint32, path string) int32                                                  `C:"krun_set_gvproxy_path"`

@@ -19,18 +19,21 @@ package task
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
-	"github.com/containerd/nerdbox/internal/erofs"
+	"github.com/containerd/nerdbox/internal/blobshare"
 	"github.com/containerd/nerdbox/internal/shim/sandbox"
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
 )
@@ -55,71 +58,75 @@ type diskOptions struct {
 }
 
 // transformMounts does not perform any local mounts but transforms
-// the mounts to be used inside the VM via virtio
-func transformMounts(ctx context.Context, id string, ms []*types.Mount, da *diskAllocator) ([]*types.Mount, []sandbox.Opt, error) {
+// the mounts to be used inside the VM via virtio.
+//
+// blobsDir is the host-side directory exposed to the guest as the
+// nerdbox-blobs virtio-fs share. Per-EROFS-layer files are hard-linked
+// into <blobsDir>/<id>/<index>.erofs and surfaced to the guest as
+// file-backed EROFS mounts under blobshare.MountPath.
+func transformMounts(ctx context.Context, id string, ms []*types.Mount, blobsDir string, da *diskAllocator) ([]*types.Mount, []sandbox.Opt, error) {
 	var (
-		addDisks []diskOptions
-		am       []*types.Mount
-		sbOpts   []sandbox.Opt
-		err      error
+		addDisks      []diskOptions
+		am            []*types.Mount
+		sbOpts        []sandbox.Opt
+		erofsLayerIdx int
+		ctrBlobsDir   string // <blobsDir>/<id>, created lazily on first EROFS layer
+		err           error
 	)
 
 	log.G(ctx).Trace("transformMounts", ms)
 	for _, m := range ms {
 		switch m.Type {
 		case "erofs":
-			letter := da.Next()
-			disk := fmt.Sprintf("disk-%d-%s", letter, id)
-			// virtiofs implementation has a limit of 36 characters for the tag
-			if len(disk) > 36 {
-				disk = disk[:36]
-			}
-
-			var Options []string
-
+			// Each "device=" option lists an additional EROFS blob
+			// referenced by the primary image. We hardlink the primary
+			// and every device-blob into the per-container subdirectory
+			// of the blob share so EROFS multi-blob lookups succeed.
 			devices := []string{m.Source}
+			var passOptions []string
 			for _, o := range m.Options {
 				if d, f := strings.CutPrefix(o, "device="); f {
 					devices = append(devices, d)
 					continue
 				}
-				Options = append(Options, o)
+				passOptions = append(passOptions, o)
 			}
 
-			if len(devices) > 1 {
-				// generate VMDK desc for the EROFS flattened fs if it does not exist
-				mergedfsPath := filepath.Dir(m.Source) + "/merged_fs.vmdk"
-				if _, err := os.Stat(mergedfsPath); err != nil {
-					if !os.IsNotExist(err) {
-						log.G(ctx).Warnf("failed to stat %v: %v", mergedfsPath, err)
-						return nil, nil, errdefs.ErrNotImplemented
-					}
-					err = erofs.DumpVMDKDescriptorToFile(mergedfsPath, 0xfffffffe, devices)
-					if err != nil {
-						log.G(ctx).Warnf("failed to generate %v: %v", mergedfsPath, err)
-						return nil, nil, errdefs.ErrNotImplemented
-					}
-				}
-				addDisks = append(addDisks, diskOptions{
-					name:     disk,
-					source:   mergedfsPath,
-					readOnly: true,
-					vmdk:     true,
-				})
-			} else {
-				addDisks = append(addDisks, diskOptions{
-					name:     disk,
-					source:   m.Source,
-					readOnly: true,
-					vmdk:     false,
-				})
+			if blobsDir == "" {
+				return nil, nil, fmt.Errorf("EROFS layer requires blobsDir: %w", errdefs.ErrInvalidArgument)
 			}
+
+			if ctrBlobsDir == "" {
+				ctrBlobsDir = filepath.Join(blobsDir, id)
+				if err := os.MkdirAll(ctrBlobsDir, 0o755); err != nil {
+					return nil, nil, fmt.Errorf("failed to create blob staging dir %s: %w", ctrBlobsDir, err)
+				}
+			}
+
+			// Hard-link the primary EROFS blob.
+			primaryName := fmt.Sprintf("%d.erofs", erofsLayerIdx)
+			if err := stageBlob(devices[0], filepath.Join(ctrBlobsDir, primaryName)); err != nil {
+				return nil, nil, fmt.Errorf("stage EROFS layer %d: %w", erofsLayerIdx, err)
+			}
+
+			// Hard-link any data-only device blobs alongside, preserving
+			// their basename so the kernel's EROFS multi-blob lookup
+			// finds them by relative path.
+			for _, d := range devices[1:] {
+				dst := filepath.Join(ctrBlobsDir, filepath.Base(d))
+				if err := stageBlob(d, dst); err != nil {
+					return nil, nil, fmt.Errorf("stage EROFS device blob %s: %w", d, err)
+				}
+			}
+
+			guestSource := path.Join(blobshare.MountPath, id, primaryName)
 			am = append(am, &types.Mount{
 				Type:    "erofs",
-				Source:  fmt.Sprintf("/dev/vd%c", letter),
+				Source:  guestSource,
 				Target:  m.Target,
-				Options: filterOptions(Options),
+				Options: filterOptions(passOptions),
 			})
+			erofsLayerIdx++
 
 		case "ext4":
 			letter := da.Next()
@@ -188,7 +195,50 @@ func transformMounts(ctx context.Context, id string, ms []*types.Mount, da *disk
 		sbOpts = append(sbOpts, sandbox.WithDisk(do.name, do.source, flags))
 	}
 
+	if ctrBlobsDir != "" {
+		sbOpts = append(sbOpts, sandbox.WithFSDAX(blobshare.Tag, blobsDir, blobshare.DefaultDAXWindow, true))
+	}
+
 	return am, sbOpts, err
+}
+
+// stageBlob makes src reachable as dst, preferring a hard link to avoid
+// any data copy. Falls back to a copy if the hard link fails (typically
+// because src and dst are on different filesystems). If dst already
+// exists with the same content (e.g. a stale hard link from a prior run
+// of the same id) the call is a no-op.
+func stageBlob(src, dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		// Already staged. Trust the prior link; in practice the only way
+		// this happens within one shim invocation is a retry, and the
+		// blob content for a given path is immutable.
+		return nil
+	}
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	} else if !os.IsExist(err) && !errors.Is(err, syscall.EXDEV) {
+		// Hard link failed for an unexpected reason; surface it.
+		return fmt.Errorf("hard link %s -> %s: %w", src, dst, err)
+	}
+	return copyFile(src, dst)
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open src %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("create dst %s: %w", dst, err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
+	}
+	return out.Close()
 }
 
 func filterOptions(options []string) []string {

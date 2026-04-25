@@ -26,6 +26,6 @@ import (
 	"github.com/containerd/nerdbox/internal/shim/sandbox"
 )
 
-func setupMounts(ctx context.Context, id string, ms []*types.Mount, _, _ string, da *diskAllocator) ([]*types.Mount, []sandbox.Opt, error) {
-	return transformMounts(ctx, id, ms, da)
+func setupMounts(ctx context.Context, id string, ms []*types.Mount, _, _ string, blobsDir string, da *diskAllocator) ([]*types.Mount, []sandbox.Opt, error) {
+	return transformMounts(ctx, id, ms, blobsDir, da)
 }

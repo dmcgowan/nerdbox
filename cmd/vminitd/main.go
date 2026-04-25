@@ -40,6 +40,7 @@ import (
 	"github.com/containerd/ttrpc"
 	"golang.org/x/sys/unix"
 
+	"github.com/containerd/nerdbox/internal/blobshare"
 	"github.com/containerd/nerdbox/internal/systools"
 	"github.com/containerd/nerdbox/internal/vminit/vmnetworking"
 	"github.com/containerd/nerdbox/plugins"
@@ -204,7 +205,7 @@ func systemInit(ctx context.Context, config ServiceConfig) (func(context.Context
 }
 
 func systemMounts() error {
-	return mount.All([]mount.Mount{
+	if err := mount.All([]mount.Mount{
 		{
 			Type:    "proc",
 			Source:  "proc",
@@ -240,7 +241,44 @@ func systemMounts() error {
 			Target:  "/dev",
 			Options: []string{"nosuid", "noexec"},
 		},
-	}, "/")
+	}, "/"); err != nil {
+		return err
+	}
+
+	// Best-effort mount of the EROFS blob share. The host shim adds a
+	// virtio-fs share tagged blobshare.Tag containing per-container
+	// EROFS layer files; vminitd mounts it here so file-backed EROFS
+	// mounts inside the container can reference paths under it.
+	// Tolerate failure for VMs that aren't using this path yet.
+	if err := os.MkdirAll(blobshare.MountPath, 0o755); err != nil {
+		return fmt.Errorf("failed to create blob mount path: %w", err)
+	}
+	// Mount without "dax". File-backed EROFS requires the underlying
+	// file's address_space_operations to expose read_folio, which the
+	// FUSE DAX a_ops do not (verified on both 6.12 and 6.18 — the
+	// fallback returns ENOTBLK). Without DAX the FUSE buffered path
+	// is used: virtiofsd reads from the host fs page cache, the guest
+	// kernel caches the read pages in its own page cache, and EROFS
+	// serves from there.
+	//
+	// We deliberately do NOT pass "cache=always" — the host directory
+	// is populated *after* the VM boots (the shim hard-links blobs
+	// during task Create), and an always-cache directory listing
+	// hides those files from the guest. The default "cache=auto"
+	// invalidates entries on access and lets new files appear.
+	if err := mount.All([]mount.Mount{
+		{
+			Type:    "virtiofs",
+			Source:  blobshare.Tag,
+			Target:  blobshare.MountPath,
+			Options: []string{"ro"},
+		},
+	}, "/"); err != nil {
+		// Not fatal: older shims don't add this share.
+		fmt.Fprintf(os.Stderr, "warning: failed to mount blob share %q at %s: %v\n", blobshare.Tag, blobshare.MountPath, err)
+	}
+
+	return nil
 }
 
 func setupCgroupControl() error {

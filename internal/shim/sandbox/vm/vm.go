@@ -81,6 +81,9 @@ func (s *localsandbox) Start(ctx context.Context, opts ...sandbox.Opt) error {
 		if fs.Readonly {
 			mountOpts = append(mountOpts, vm.WithReadOnly())
 		}
+		if fs.DAXWindow > 0 {
+			mountOpts = append(mountOpts, vm.WithDAXWindow(fs.DAXWindow))
+		}
 		if err := vmi.AddFS(ctx, fs.Tag, fs.MountPath, mountOpts...); err != nil {
 			return err
 		}
