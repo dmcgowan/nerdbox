@@ -785,8 +785,8 @@ func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (*ptyp
 		if stdinEOF != nil {
 			if err := stdinEOF(); err != nil {
 				log.G(ctx).WithError(err).WithFields(log.Fields{
-					"id":   r.ID,
-					"exec": r.ExecID,
+					"container": r.ID,
+					"exec":      r.ExecID,
 				}).Error("failed to send stdin EOF")
 				return nil, errgrpc.ToGRPC(err)
 			}
@@ -870,8 +870,8 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 		case <-ioDone:
 		case <-drainCtx.Done():
 			log.G(ctx).WithError(drainCtx.Err()).WithFields(log.Fields{
-				"id":   r.ID,
-				"exec": r.ExecID,
+				"container": r.ID,
+				"exec":      r.ExecID,
 			}).Warn("timed out waiting for IO drain after wait")
 		}
 	}
